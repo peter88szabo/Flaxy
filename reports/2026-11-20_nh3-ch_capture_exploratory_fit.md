@@ -34,7 +34,7 @@ V = d + U_NH3(q_A) + U_CH(r) + L_damp(R, Ω, q) + (1 − g(R)) f_S3(y)
 | Fit | Two stages. (1) All terms on 300 K, R ≥ 9 Å; keep the tail. (2) Monomers on R ≥ 7 Å with the tail frozen. |
 | Switch | C² quintic step in R between R_in = 5 Å and R_out = 7 Å. Beyond 7 Å, V equals the baseline exactly. |
 | f_S3 | Short-range correction, exactly symmetric under the hydrogen swaps (S3). Kernel: Matérn-5/2 on y = exp(−r/a) for the 15 pair distances (a = 1.5/2.0/1.5 bohr for NH/HH/CH, 4.0 bohr between molecules), length 0.8, ridge 10⁻⁶, energies only. Tensor train: Gaussian dictionaries per pair. |
-| Weights | Provisional Bowman-type, ΔE = 10 kcal/mol (TODO in `src/flaxy/weights.py`). |
+| Weights | Provisional Bowman-type, ΔE = 10 kcal/mol (TODO in `src/weights.py`). |
 
 Forces are analytic everywhere. The tests (15, pytest) check:
 - forces against Richardson finite differences, including inside the switch;
@@ -68,7 +68,7 @@ Validation RMSE in the 4.5–12 Å files (full model):
 *Rigid radial cuts of 300 K validation geometries. Top: R³[V − V∞]. Bottom: −dV/dR. Grey band: the switch. Blue: baseline only. Orange: full kernel surface.*
 
 ## Short range: kernel model (reference surface)
-`runs/krr_sw_5.0_7.0/surface_krr.npz`
+Regenerated with the general `System` code as `runs/v2_krr/surface_krr.npz`. The numbers are the same within noise: 222.7 cm⁻¹ in-range validation, dipole–dipole coefficient −0.3331 ± 0.0035. The table below is from the original run.
 
 | In-range validation | n | RMSE (cm⁻¹) |
 |---|---:|---:|
@@ -127,7 +127,7 @@ These numbers are on the internal tuning split (700 geometries). The kernel mode
 **Model**
 - Add a pairwise repulsive wall to the baseline.
 - Use the relaxed NH3 + CH limit as the energy reference (fit twice).
-- Set the in-range weighting function (`src/flaxy/weights.py`).
+- Set the in-range weighting function (`src/weights.py`).
 
 **Scaling**
 - A sparse (inducing-point) kernel model beyond about 20–30k points.
@@ -141,8 +141,8 @@ These numbers are on the internal tuning split (700 geometries). The kernel mode
 ```bash
 venv                                     # ~/.venvs/science
 python -m pytest -q                      # 15 tests
-python scripts/fit_capture.py --out runs/krr_sw_5.0_7.0 --models krr --krr-lengths 0.8
-python scripts/plot_cuts.py runs/krr_sw_5.0_7.0/surface_krr.npz --n-cuts 12
+python scripts/fit_capture.py --out runs/v2_krr --models krr --krr-lengths 0.8
+python scripts/plot_cuts.py runs/v2_krr/surface_krr.npz --n-cuts 12
 ```
-- Code: `src/flaxy/`
+- Code: `src/`
 - Design notes and the full log of findings: `docs/superpowers/specs/2026-11-20-nh3-ch-capture-fit-design.md`

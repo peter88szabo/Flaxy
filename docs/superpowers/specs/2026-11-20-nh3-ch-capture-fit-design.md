@@ -52,7 +52,7 @@ V(x) = d + U_NH3(q_A) + U_CH(r_CH) + L_damp(R, Ω, q) + (1 − g(x)) · (P_S3 f)
 
 ## Builder's calls
 Python = `~/.venvs/science` (alias `venv`; numpy 2.4, scipy 1.17, pytest), package in
-`src/flaxy/`, NumPy-only, vectorized forward-mode duals for the baseline pieces,
+`src/`, NumPy-only, vectorized forward-mode duals for the baseline pieces,
 hand-written gradients for KRR/TT. pytest: permutation/rotation/translation
 invariance, Richardson FD gradients, zero net force and torque, gate limits,
 save/load. In-domain energy weighting function: user contribution.

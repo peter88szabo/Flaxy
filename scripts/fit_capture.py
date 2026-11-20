@@ -16,18 +16,19 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flaxy.baseline import Baseline  # noqa: E402
-from flaxy.data import load_dataset, load_split, validation_mask  # noqa: E402
-from flaxy.features import DEFAULT_RANGES, PairFeatures  # noqa: E402
-from flaxy.geometry import pair_vectors  # noqa: E402
-from flaxy.krr import SymKRR  # noqa: E402
-from flaxy.report import error_table, format_table  # noqa: E402
-from flaxy.surface import Surface  # noqa: E402
-from flaxy.tt import GaussianTT  # noqa: E402
-from flaxy.units import ANG_BOHR, HARTREE_CM, HARTREE_KCAL  # noqa: E402
-from flaxy.weights import KJ_PER_KCAL, energy_weights, in_domain  # noqa: E402
+from src.baseline import Baseline  # noqa: E402
+from src.data import load_dataset, load_split, validation_mask  # noqa: E402
+from src.features import PairFeatures  # noqa: E402
+from src.geometry import pair_vectors  # noqa: E402
+from src.krr import SymKRR  # noqa: E402
+from src.report import error_table, format_table  # noqa: E402
+from src.surface import Surface  # noqa: E402
+from src.system import nh3_ch  # noqa: E402
+from src.tt import GaussianTT  # noqa: E402
+from src.units import ANG_BOHR, HARTREE_CM, HARTREE_KCAL  # noqa: E402
+from src.weights import KJ_PER_KCAL, energy_weights, in_domain  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,7 +84,9 @@ def main():
     log = Log(out / "fit.log")
     log("config", json.dumps(vars(a)))
 
-    ds = load_dataset(a.data)
+    system = nh3_ch()
+    log(system.summary())
+    ds = load_dataset(a.data, system)
     valid = validation_mask(ds, load_split(a.split))
     e_asym = float(ds.E[~valid & (ds.R >= a.tail_rmin)].min())
     e_rel = (ds.E - e_asym) * HARTREE_KCAL
@@ -96,7 +99,8 @@ def main():
 
     # ------------------------------------------------------------- baseline
     T, R = ds.temperature, ds.R
-    base = Baseline.build(ds.X[train], nh3_degree=a.nh3_degree, ch_degree=a.ch_degree, beta=a.beta)
+    feats = PairFeatures(system, inter=a.inter_range)
+    base = Baseline.build(system, ds.X[train], feats, degrees=(a.nh3_degree, a.ch_degree), beta=a.beta)
     tr = np.flatnonzero(train)
     binfo = base.fit_two_stage(ds.X[tr], ds.E[tr], w[tr], tail_rows=(T[tr] == 300) & (R[tr] >= a.tail_rmin),
                                mono_rows=R[tr] >= a.mono_rmin, ridge=1e-12)
@@ -104,14 +108,12 @@ def main():
     log(f"baseline stage-1 RMSE {binfo['rmse'] * HARTREE_CM:.2f} cm-1 (n {binfo['n']}), "
         f"stage-2 monomer RMSE {binfo['mono_rmse'] * HARTREE_CM:.2f} cm-1 (n {binfo['mono_n']})")
 
-    ranges = dict(DEFAULT_RANGES)
-    ranges.update({k: a.inter_range for k in ("HC", "NC", "NH5", "HH5")})
-    feats = PairFeatures(ranges)
     r_in, r_out = a.r_in * ANG_BOHR, a.r_out * ANG_BOHR
-    surf0 = Surface(base, feats, None, r_in, r_out)
+    surf0 = Surface(system, base, feats, None, r_in, r_out)
     target, scale = surf0.inner_residual_target(ds.X, ds.E)
-    _, r = pair_vectors(ds.X)
-    Y, _ = feats(r)
+    _, r = pair_vectors(ds.X, system)
+    Y = feats(r)[0][:, system.active_pairs]
+    perms = system.active_pair_perms
     inner = train & (scale > 0)
     tune = np.random.default_rng(a.seed).random(len(ds)) < a.tune_frac
     fit_rows, tune_rows = inner & ~tune, inner & tune
@@ -126,24 +128,25 @@ def main():
         scores = {}
         for length in a.krr_lengths:
             t0 = time.time()
-            k = SymKRR(length, a.krr_ridge).fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows])
+            k = SymKRR(perms, length, a.krr_ridge).fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows])
             scores[length] = wrmse_cm(scale[tune_rows] * k.predict(Y[tune_rows]), target[tune_rows], w[tune_rows])
             log(f"KRR length {length}: tune wRMSE {scores[length]:.1f} cm-1 ({time.time() - t0:.0f}s)")
         best = min(scores, key=scores.get)
-        krr = SymKRR(best, a.krr_ridge).fit(Y[inner], target[inner], w[inner], scale[inner])
-        surfaces["krr"] = Surface(base, feats, krr, r_in, r_out)
+        krr = SymKRR(perms, best, a.krr_ridge).fit(Y[inner], target[inner], w[inner], scale[inner])
+        surfaces["krr"] = Surface(system, base, feats, krr, r_in, r_out)
         report["models"]["krr"] = {"length": best, "tune_scores": scores, "n_centers": int(inner.sum()),
                                    "n_params": int(inner.sum())}
         log(f"KRR refit on all inner rows with length {best}")
 
     # ------------------------------------------------------------------- TT
     if "tt" in a.models:
-        tt = GaussianTT.initialize(Y[inner], n_gauss=a.tt_gauss, width_factor=a.tt_width, rank=2, seed=a.seed)
+        tt = GaussianTT.initialize(Y[inner], perms, system.active_pair_type, n_gauss=a.tt_gauss,
+                                   width_factor=a.tt_width, rank=2, seed=a.seed)
         hist = tt.fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows],
                       Y[tune_rows], target[tune_rows], w[tune_rows], scale[tune_rows],
                       sweeps=a.tt_sweeps, rank_cap=a.tt_rank, ridge=a.tt_ridge, prox=a.tt_prox,
                       log=lambda m: log(m))
-        surfaces["tt"] = Surface(base, feats, tt, r_in, r_out)
+        surfaces["tt"] = Surface(system, base, feats, tt, r_in, r_out)
         report["models"]["tt"] = {"ranks": tt.ranks, "n_params": tt.n_params,
                                   "history": [(h[0], h[1], h[2]) for h in hist]}
         log(f"TT ranks {tt.ranks}, {tt.n_params} parameters")
