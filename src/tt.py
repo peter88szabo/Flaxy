@@ -1,11 +1,13 @@
-"""Gaussian tensor train over pair features, projected onto a permutation group, fitted by ALS.
+"""Gaussian tensor train over input features (PIPs), fitted by two-site ALS.
 
 f(y) = A_1(y_1) ... A_d(y_d),   A_j(y) = sum_k G_j[:, k, :] phi_jk(y),
 phi_j0 = 1 (constant feature, so low-order couplings cost little rank) and
 phi_jk = exp(-(y - c_jk)^2 / (2 w_jk^2)) for k >= 1, whitened per site.
 
-The surface uses the projection f_G(y) = |G|^-1 sum_P f(y[gather_P]) times the
-switch factor s(x). Fitting uses the two-site alternating scheme: merge cores
+With permutation-invariant (PIP) inputs the model is evaluated once per geometry
+(pair_perms = identity). The optional pair_perms argument averages over input
+permutations instead; it is kept only for raw (non-invariant) inputs. The surface
+multiplies f by the switch factor s(x). Fitting uses the two-site alternating scheme: merge cores
 j, j+1, solve the linear least-squares problem for the merged core with ridge and a
 proximal term, split it by an SVD in the data metric (adapts the bond rank), and
 re-fit the neighbouring core. Analytic gradient and Hessian in y.
@@ -16,8 +18,10 @@ import scipy.linalg as sl
 
 class GaussianTT:
     def __init__(self, pair_perms, pair_types, centers, widths, cores, transforms=None, y_scale=1.0):
-        self.pair_perms = np.asarray(pair_perms)
-        self.pair_types = tuple(str(t) for t in pair_types)
+        d = len(centers)
+        self.pair_perms = np.arange(d)[None] if pair_perms is None else np.asarray(pair_perms)
+        self.pair_types = tuple(f"z{j}" for j in range(d)) if pair_types is None else \
+            tuple(str(t) for t in pair_types)
         self.centers = [np.asarray(c, dtype=float) for c in centers]
         self.widths = [np.asarray(w, dtype=float) for w in widths]
         self.cores = [None if G is None else np.asarray(G, dtype=float) for G in cores]
@@ -121,10 +125,12 @@ class GaussianTT:
 
     # ------------------------------------------------------------------ fitting
     @classmethod
-    def initialize(cls, Y, pair_perms, pair_types, n_gauss=6, width_factor=1.0, rank=2, noise=1e-2,
-                   seed=0):
-        """Quantile centres per pair type (pooled over equivalent pairs), near-constant cores."""
+    def initialize(cls, Y, pair_perms=None, pair_types=None, n_gauss=6, width_factor=1.0, rank=2,
+                   noise=1e-2, seed=0):
+        """Quantile centres per input (pooled over equal types), near-constant cores."""
         rng = np.random.default_rng(seed)
+        if pair_types is None:
+            pair_types = [f"z{j}" for j in range(Y.shape[1])]
         types = np.array(pair_types)
         centers, widths = [], []
         for j in range(Y.shape[1]):
@@ -150,12 +156,15 @@ class GaussianTT:
 
     def fit(self, Y, target, weight, scale, Y_val=None, target_val=None, weight_val=None,
             scale_val=None, sweeps=6, rank_cap=8, svd_tol=1e-8, ridge=1e-8, prox=1e-6,
-            chunk=1024, accept_tol=1e-3, log=print):
-        """Two-site ALS. Rows with scale = 1 - g = 0 carry no information and are dropped.
+            chunk=1024, accept_tol=1e-3, two_site_sweeps=2, log=print):
+        """ALS. Rows with scale = 1 - g = 0 carry no information and are dropped.
 
-        An update is kept only if the weighted training loss does not rise by more
-        than accept_tol (relative); truncation at the rank cap can otherwise undo
-        progress. Returns a history of (half-sweep, scores, ranks).
+        The first `two_site_sweeps` sweeps are two-site (merged core, truncated SVD in
+        the data metric: grows the bond ranks up to rank_cap). The remaining sweeps are
+        one-site: an exact least-squares solve per core followed by a QR gauge move, no
+        truncation, so the loss cannot rise. A two-site update is kept only if the
+        weighted training loss does not rise by more than accept_tol (relative).
+        Returns a history of (half-sweep, scores, ranks).
         """
         keep = scale > 0
         Y, r, w, s = Y[keep], target[keep], weight[keep], scale[keep]
@@ -182,6 +191,18 @@ class GaussianTT:
         current = loss()
         for sweep in range(sweeps):
             for forward in (True, False):
+                if sweep >= two_site_sweeps:
+                    current = self._one_site_sweep(forward, phis, L_env, R_env, r, w, s, chunk,
+                                                   ridge, prox, loss, current)
+                    sc = score()
+                    sc["rejected"] = 0
+                    history.append((sweep + 0.5 * (not forward) + 0.5, sc, list(self.ranks)))
+                    key = sc.get("valid", sc["train"])
+                    if key < best[0]:
+                        best = (key, [G.copy() for G in self.cores])
+                    log(f"  TT sweep {sweep + 1}{'>' if forward else '<'} (one-site) train "
+                        f"{sc['train']:.3e} valid {sc.get('valid', float('nan')):.3e} Eh  ranks {self.ranks}")
+                    continue
                 sites = range(d - 1) if forward else range(d - 2, -1, -1)
                 rejected = 0
                 for j in sites:
@@ -229,6 +250,33 @@ class GaussianTT:
                     f"  rejected {rejected}")
         self.cores = best[1]
         return history
+
+    def _one_site_sweep(self, forward, phis, L_env, R_env, r, w, s, chunk, ridge, prox, loss, current):
+        """Exact one-site updates along the chain with QR gauge moves; returns the new loss."""
+        d = self.n_sites
+        for j in (range(d) if forward else range(d - 1, -1, -1)):
+            rl, b, rr = self.cores[j].shape
+            old = self.cores[j].copy()
+            left = _with_site_left(L_env[j], phis, j)                     # (|G|, n, rl*b)
+            H, rhs, _, _ = _normal(left, R_env[j], r, w, s, chunk)
+            self.cores[j] = _ridge_solve(H, rhs, old.ravel(), ridge, prox).reshape(rl, b, rr)
+            new = loss()
+            if new > current:
+                self.cores[j] = old
+            else:
+                current = new
+            # Move the gauge to the next site (the function is unchanged) and refresh its environment.
+            if forward and j < d - 1:
+                q, t = np.linalg.qr(self.cores[j].reshape(rl * b, rr))
+                self.cores[j] = q.reshape(rl, b, -1)
+                self.cores[j + 1] = np.tensordot(t, self.cores[j + 1], axes=1)
+                L_env[j + 1] = _env_left(L_env[j], phis, j, self.cores[j])
+            elif not forward and j > 0:
+                q, t = np.linalg.qr(self.cores[j].reshape(rl, b * rr).T)
+                self.cores[j] = q.T.reshape(-1, b, rr)
+                self.cores[j - 1] = np.tensordot(self.cores[j - 1], t.T, axes=1)
+                R_env[j - 1] = _env_right(R_env[j], phis, j, self.cores[j])
+        return current
 
     def _fitted(self, phis, s):
         out = np.zeros(len(s))

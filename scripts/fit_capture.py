@@ -22,7 +22,8 @@ from src.baseline import Baseline  # noqa: E402
 from src.data import load_dataset, load_split, validation_mask  # noqa: E402
 from src.features import PairFeatures  # noqa: E402
 from src.geometry import pair_vectors  # noqa: E402
-from src.krr import SymKRR  # noqa: E402
+from src.invariants import InvariantFeatures  # noqa: E402
+from src.krr import KRR  # noqa: E402
 from src.report import error_table, format_table  # noqa: E402
 from src.surface import Surface  # noqa: E402
 from src.system import nh3_ch  # noqa: E402
@@ -50,7 +51,8 @@ def parse():
     p.add_argument("--inter-range", type=float, default=4.0, help="bohr, Morse range of intermolecular pairs")
     p.add_argument("--tune-frac", type=float, default=0.12)
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--krr-lengths", type=float, nargs="+", default=[0.6, 0.8, 1.1])
+    p.add_argument("--pip-degree", type=int, default=3, help="max degree of the PIP input features")
+    p.add_argument("--krr-lengths", type=float, nargs="+", default=[4.0, 8.0, 16.0, 32.0])
     p.add_argument("--krr-ridge", type=float, default=1e-6)
     p.add_argument("--tt-gauss", type=int, default=6)
     p.add_argument("--tt-rank", type=int, default=8)
@@ -112,9 +114,11 @@ def main():
     surf0 = Surface(system, base, feats, None, r_in, r_out)
     target, scale = surf0.inner_residual_target(ds.X, ds.E)
     _, r = pair_vectors(ds.X, system)
-    Y = feats(r)[0][:, system.active_pairs]
-    perms = system.active_pair_perms
     inner = train & (scale > 0)
+    pips = InvariantFeatures.build(system, feats, a.pip_degree).standardize(r[inner])
+    Y = pips(r)
+    log(f"PIP inputs: degree {a.pip_degree}, {pips.n} invariants of {len(system.active_pairs)} active pairs "
+        f"({len(pips.orbit)} monomials)")
     tune = np.random.default_rng(a.seed).random(len(ds)) < a.tune_frac
     fit_rows, tune_rows = inner & ~tune, inner & tune
     log(f"inner rows {inner.sum()} (fit {fit_rows.sum()}, tune {tune_rows.sum()}); "
@@ -128,25 +132,25 @@ def main():
         scores = {}
         for length in a.krr_lengths:
             t0 = time.time()
-            k = SymKRR(perms, length, a.krr_ridge).fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows])
+            k = KRR(length, a.krr_ridge).fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows])
             scores[length] = wrmse_cm(scale[tune_rows] * k.predict(Y[tune_rows]), target[tune_rows], w[tune_rows])
             log(f"KRR length {length}: tune wRMSE {scores[length]:.1f} cm-1 ({time.time() - t0:.0f}s)")
         best = min(scores, key=scores.get)
-        krr = SymKRR(perms, best, a.krr_ridge).fit(Y[inner], target[inner], w[inner], scale[inner])
-        surfaces["krr"] = Surface(system, base, feats, krr, r_in, r_out)
+        krr = KRR(best, a.krr_ridge).fit(Y[inner], target[inner], w[inner], scale[inner])
+        surfaces["krr"] = Surface(system, base, feats, krr, r_in, r_out, pips)
         report["models"]["krr"] = {"length": best, "tune_scores": scores, "n_centers": int(inner.sum()),
                                    "n_params": int(inner.sum())}
         log(f"KRR refit on all inner rows with length {best}")
 
     # ------------------------------------------------------------------- TT
     if "tt" in a.models:
-        tt = GaussianTT.initialize(Y[inner], perms, system.active_pair_type, n_gauss=a.tt_gauss,
-                                   width_factor=a.tt_width, rank=2, seed=a.seed)
+        tt = GaussianTT.initialize(Y[inner], n_gauss=a.tt_gauss, width_factor=a.tt_width, rank=2,
+                                   seed=a.seed)
         hist = tt.fit(Y[fit_rows], target[fit_rows], w[fit_rows], scale[fit_rows],
                       Y[tune_rows], target[tune_rows], w[tune_rows], scale[tune_rows],
                       sweeps=a.tt_sweeps, rank_cap=a.tt_rank, ridge=a.tt_ridge, prox=a.tt_prox,
                       log=lambda m: log(m))
-        surfaces["tt"] = Surface(system, base, feats, tt, r_in, r_out)
+        surfaces["tt"] = Surface(system, base, feats, tt, r_in, r_out, pips)
         report["models"]["tt"] = {"ranks": tt.ranks, "n_params": tt.n_params,
                                   "history": [(h[0], h[1], h[2]) for h in hist]}
         log(f"TT ranks {tt.ranks}, {tt.n_params} parameters")

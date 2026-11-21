@@ -33,8 +33,10 @@ Under development. Pure NumPy/SciPy. Method notes: `notes/main_ideas.tex`. Fit r
 
 ## How the PES is partitioned
 ```
-one fragment:   V(x) = U(x) +            f_G(y_active(x))
-two fragments:  V(x) = U(x) + (1 − g(R)) f_G(y_active(x))
+one fragment:   V(x) = U(x) +            f(Z(x))
+two fragments:  V(x) = U(x) + (1 − g(R)) f(Z(x))
+
+Z = permutation-invariant polynomials (PIPs) of the active pair distances
 
 U = d (+ invariant polynomial of the molecule)                     one fragment
 U = d + U_A(q_A) + U_B(q_B) + L(R, orientation, q)                 two fragments
@@ -55,9 +57,11 @@ U = d + U_A(q_A) + U_B(q_B) + L(R, orientation, q)                 two fragments
 - **Switch `g(R)`** (two fragments).
   - A C² quintic step between R_in and R_out.
   - Beyond R_out, V is exactly the physical baseline.
-- **Short range `f_G`.**
+- **Short range `f(Z)`.**
   - Learns the residual E − U.
-  - Inputs are the active pair features exp(−r/a), averaged over the permutation group G, which makes it exactly invariant.
+  - Its inputs Z are PIPs: orbit sums of Morse monomials of the active pairs, generated from the group by the same code as the fragment polynomials.
+  - Every input is invariant by construction, so the model is evaluated once per geometry. No averaging over the group happens in fitting or evaluation.
+  - Forces and Hessians use the exact derivatives dZ/dr and d²Z/dr².
 
 ## Permutation groups for larger systems
 `System(symbols, fragments=None, bonds=None | X_ref=..., mobile=(), active=None, group="bonds")`
@@ -65,7 +69,7 @@ U = d + U_A(q_A) + U_B(q_B) + L(R, orientation, q)                 two fragments
 - **`group="bonds"`** (default). All element-preserving permutations that keep the bond graph. These are the feasible permutations of a fixed-connectivity domain.
   - Bonds are given explicitly, or detected from a reference geometry via covalent radii.
   - Example, C5H8O3 as isoprene + O₃: 48 permutations instead of 5!·8!·3! = 29,030,400.
-  - Averaging over the group stays cheap.
+  - The group is used once, to build the PIP inputs and polynomials. Its size does not enter the evaluation cost.
 - **`mobile`.** Atoms that may change bonding partners, e.g. migrating H. Their bonds are ignored, so they permute freely among mobile atoms of the same element. In the isoprene example, making the C1/C4 hydrogens mobile gives 288.
 
 **What the bond constraint keeps and what it removes.** The group is not "permutations of the mobile atoms only". It contains two kinds of permutations:
@@ -95,18 +99,19 @@ U = d + U_A(q_A) + U_B(q_B) + L(R, orientation, q)                 two fragments
 
 ### The tensor train (TT)
 A TT, also called a matrix product state, writes a function of d coordinates
-(the active pair features) as a chain of small matrices:
+(here the d PIP inputs) as a chain of small matrices:
 `f(y) = A_1(y_1) A_2(y_2) ··· A_d(y_d)`, with `A_j(y) = Σ_k G_j[:, k, :] φ_jk(y)`.
 
 - **Basis.** φ_jk are 1-D Gaussians plus a constant, whitened per site.
 - **Parameters.** The full expansion would need b^d coefficients (7^15 ≈ 5·10^12). The chain needs only about d·b·r², where the rank r sets how strongly coordinates couple.
 - **Cost.** Energy, gradient and Hessian come from left/right matrix products. They cost about d·b·r² operations per geometry (d²·b·r² for the Hessian), independent of the training-set size.
-- **Fitting.** Uses DMRG-like two-site sweeps:
-  1. freeze all cores except two neighbours;
-  2. solve the linear least-squares problem for their merged core;
-  3. split it by an SVD in the data metric, which adapts the rank;
-  4. re-fit the neighbouring core;
-  5. move along the chain.
+- **Fitting.** DMRG-like sweeps.
+  - **Two-site sweeps grow the ranks:**
+    1. freeze all cores except two neighbours;
+    2. solve the linear least-squares problem for their merged core;
+    3. split it by an SVD in the data metric;
+    4. re-fit the neighbouring core.
+  - **One-site sweeps refine:** an exact solve per core plus a QR gauge move, so the loss cannot rise.
 
 ## Code map (`src/`)
 | Module | Role |
@@ -115,7 +120,8 @@ A TT, also called a matrix product state, writes a function of d coordinates
 | `features.py` | pair features exp(−r/a), ranges tied by pair type |
 | `monomer.py`, `tail.py`, `baseline.py` | invariant polynomials; multipole tail; reference energy U and its linear fit |
 | `switch.py` | quintic switching function |
-| `krr.py`, `tt.py` | short-range models: group-projected kernel ridge regression, Gaussian tensor train |
+| `invariants.py` | PIP input features of the active pairs, with exact first and second derivatives |
+| `krr.py`, `tt.py` | short-range models on the PIP inputs: kernel ridge regression, Gaussian tensor train |
 | `surface.py` | assembled PES: `energy`, `energy_forces`, `energy_forces_hessian`, `save`/`load` |
 | `analysis.py` | harmonic frequencies (mass-weighted, translations/rotations projected out) |
 | `data.py`, `weights.py`, `report.py` | xyz input and splits; fit domain and weights; error tables |
@@ -137,7 +143,8 @@ from src.data import load_dataset
 from src.features import PairFeatures
 from src.geometry import pair_vectors
 from src.baseline import Baseline
-from src.krr import SymKRR
+from src.invariants import InvariantFeatures
+from src.krr import KRR
 from src.surface import Surface
 
 # 1. System: symbols in file order; bonds from a reference geometry (Angstrom).
@@ -149,12 +156,12 @@ feats = PairFeatures(system)
 base = Baseline.build(system, ds.X, feats, degrees=(6, 6))
 base.fit(ds.X[long_range], ds.E[long_range])             # or fit_two_stage(...)
 
-# 3. Short-range model on the residual (one fragment: omit r_in, r_out).
+# 3. Short-range model on PIP inputs (one fragment: omit r_in, r_out).
 pes = Surface(system, base, feats, None, r_in=5.0 / 0.529177, r_out=7.0 / 0.529177)
 target, s = pes.inner_residual_target(ds.X, ds.E)
 _, r = pair_vectors(ds.X, system)
-Y = feats(r)[0][:, system.active_pairs]
-pes.inner = SymKRR(system.active_pair_perms, length=0.8).fit(Y, target, weights, s)
+pes.pips = InvariantFeatures.build(system, feats, degree=3).standardize(r)
+pes.inner = KRR(length=32.0).fit(pes.pips(r), target, weights, s)
 
 # 4. Use.
 E, F = pes.energy_forces(X)              # Hartree, Hartree/bohr
@@ -181,10 +188,13 @@ First application: NH₃ + CH capture, 13,422 MRCC energies. Details in `reports
 
 **Validated**
 - **Long range.** The dipole–dipole coefficient is −0.333 ± 0.004 a.u., against −μ(NH₃)μ(CH) ≈ −0.33 from experimental dipoles.
-- **Kernel model.** 223 cm⁻¹ (0.64 kcal/mol) on validation geometries within 200 kJ/mol of the dissociation limit.
+- **Kernel model.** Validation geometries within 200 kJ/mol of the dissociation limit:
+  - PIP inputs (degree 3): 455 cm⁻¹, at 0.2 ms per energy + forces;
+  - the earlier group-averaged kernel: 223 cm⁻¹, at 0.8 ms per energy + forces.
 - **Analytic Hessian.** CH stretch 2857.1 cm⁻¹ on the fitted surface, against ω_e = 2858.5; the degenerate NH₃ modes come out exactly degenerate.
 
 **Open**
+- **PIP kernel accuracy.** Closing the gap to the group-averaged kernel needs more data or a better invariant set.
 - **Tensor train.** It trails the kernel model with about 5k energies.
 - **Large fragments.** A big fragment's own energy (e.g. isoprene, 78 distances) needs a kernel model; the polynomial only works at low degree.
 - **Inter-fragment exchange** needs the multi-channel switch of the notes.
