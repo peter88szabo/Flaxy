@@ -96,11 +96,16 @@ def load_dataset(data_dir, system, key="E_Bps"):
     return Dataset(cat[0], cat[1], [p.stem for p in paths], cat[2], cat[3], cat[4], cat[5], cat[6])
 
 
-def make_split(ds, n_valid=300, seed=20261120):
-    """Pick n_valid geometries per file, spread evenly over its R shells."""
+def make_split(ds, n_valid=300, seed=20261120, skip=()):
+    """Pick n_valid geometries per file, spread evenly over its R shells.
+
+    Files named in `skip` (e.g. those already in an existing split) are left out, so
+    new data files can be added without changing the earlier validation picks."""
     rng = np.random.default_rng(seed)
     split = {}
     for f, stem in enumerate(ds.files):
+        if stem in skip:
+            continue
         idx = np.flatnonzero(ds.file == f)
         shells = np.unique(ds.shell[idx])
         quota = np.full(len(shells), n_valid // len(shells))

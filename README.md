@@ -184,7 +184,15 @@ python -m pytest -q     # 27 tests: derivatives vs finite differences, invarianc
 ```
 
 ## Status
-First application: NH₃ + CH capture, 13,422 MRCC energies. Details in `reports/2026-11-20_nh3-ch_capture_exploratory_fit.md`.
+First application: NH₃ + CH capture.
+
+**Current best fit:** [reports/2026-11-23_nh3-ch_capture_pes_best_fit.md](reports/2026-11-23_nh3-ch_capture_pes_best_fit.md).
+- **Data:** 21,963 MRCC energies; 11,012 within 120 kJ/mol of the NH₃ + CH limit are fitted.
+- **Accuracy:** validation RMSE 187 cm⁻¹ overall and 4–5 cm⁻¹ beyond 7 Å.
+- **Capture path:** barrierless. The minimum energy path comes in collinear down to a saddle at 3.72 Å (−663 cm⁻¹), then turns side-on.
+- **Report contents:** model details, long-range coefficients, error table by distance, approach scans and the minimum energy path.
+
+The earlier exploratory fit (13,422 energies, up to 200 kJ/mol) is in `reports/2026-11-20_nh3-ch_capture_exploratory_fit.md`. The notes below describe that stage.
 
 **Validated**
 - **Long range.** The dipole–dipole coefficient is −0.333 ± 0.004 a.u., against −μ(NH₃)μ(CH) ≈ −0.33 from experimental dipoles.
